@@ -1,0 +1,474 @@
+@startuml serial_helper_architecture
+
+' ============================================================
+'  serial_helper – Software Architecture
+'  PlantUML source  (render with plantuml.jar or online server)
+'
+'  Two views:
+'    Part 1 – Static / Class Diagram
+'    Part 2 – Dynamic / Sequence Diagram
+' ============================================================
+
+' ============================================================
+'  PART 1 – STATIC VIEW: Class Diagram
+' ============================================================
+
+title serial_helper Library – Class Diagram (Static View)
+
+hide empty members
+skinparam classAttributeIconSize 0
+skinparam classFontSize 13
+skinparam classBackgroundColor #FEFEFE
+skinparam classBorderColor #888888
+skinparam arrowColor #444444
+skinparam noteBackgroundColor #FFFDE7
+skinparam noteBorderColor #F9A825
+
+' -------------------------------------------------------
+'  Enumerations / Value Types
+' -------------------------------------------------------
+
+package "serial :: types & config" #EEF5FF {
+
+    enum baud_rate {
+        B_9600
+        B_115200
+        B_230400
+        B_460800
+        B_921600
+        .. (all standard UART rates) ..
+        B_4000000
+    }
+
+    enum data_bits {
+        FIVE
+        SIX
+        SEVEN
+        EIGHT
+    }
+
+    enum parity {
+        NONE
+        ODD
+        EVEN
+    }
+
+    enum stop_bits {
+        ONE
+        TWO
+    }
+
+    enum flow_control {
+        NONE
+        HARDWARE
+        SOFTWARE
+    }
+
+    class serial_config << (S,#77AAFF) struct >> {
+        + device_path : string
+        + baud : baud_rate
+        + data : data_bits
+        + par : parity
+        + stop : stop_bits
+        + flow : flow_control
+        + read_timeout_ms : int
+        + non_blocking : bool
+        __factory helpers__
+        + {static} gnss_default(dev) : serial_config
+        + {static} gnss_high_speed(dev) : serial_config
+        + {static} custom(dev, baud) : serial_config
+    }
+
+    serial_config ..> baud_rate
+    serial_config ..> data_bits
+    serial_config ..> parity
+    serial_config ..> stop_bits
+    serial_config ..> flow_control
+}
+
+' -------------------------------------------------------
+'  Exception Hierarchy
+' -------------------------------------------------------
+
+package "serial :: exceptions" #FFF3E0 {
+
+    class "std::runtime_error" as runtime_error << (E,#FF9800) >>
+    class serial_error << (E,#FFB74D) >> {
+        + serial_error(msg)
+    }
+    class serial_open_error << (E,#FFB74D) >> {
+        + serial_open_error(msg)
+    }
+    class serial_config_error << (E,#FFB74D) >> {
+        + serial_config_error(msg)
+    }
+    class serial_read_error << (E,#FFB74D) >> {
+        + serial_read_error(msg)
+    }
+    class serial_write_error << (E,#FFB74D) >> {
+        + serial_write_error(msg)
+    }
+    class serial_timeout_error << (E,#FFB74D) >> {
+        + serial_timeout_error(msg)
+    }
+
+    serial_error        --|> runtime_error
+    serial_open_error   --|> serial_error
+    serial_config_error --|> serial_error
+    serial_read_error   --|> serial_error
+    serial_write_error  --|> serial_error
+    serial_timeout_error --|> serial_error
+}
+
+' -------------------------------------------------------
+'  Interface Segregation (ISP)
+' -------------------------------------------------------
+
+package "serial :: interfaces" #E8F5E9 {
+
+    interface i_serial_reader << interface >> {
+        + {abstract} read_byte(c : char&) : ssize_t
+        + {abstract} read_chars(buf : char*, len : size_t) : ssize_t
+        + {abstract} read_string(str : string&, max_len : size_t) : ssize_t
+        + {abstract} read_bytes(buf : vector<uint8_t>&, max_len : size_t) : ssize_t
+        + {abstract} available() : int
+    }
+
+    interface i_serial_writer << interface >> {
+        + {abstract} write_byte(c : char) : ssize_t
+        + {abstract} write_chars(buf : const char*, len : size_t) : ssize_t
+        + {abstract} write_string(str : const string&) : ssize_t
+        + {abstract} write_bytes(buf : const vector<uint8_t>&) : ssize_t
+    }
+
+    interface i_serial_port << interface >> {
+        + {abstract} open(config : const serial_config&) : bool
+        + {abstract} close() : void
+        + {abstract} is_open() : bool
+        + {abstract} get_config() : const serial_config&
+        + {abstract} flush() : bool
+        + {abstract} drain() : bool
+    }
+
+    i_serial_port --|> i_serial_reader
+    i_serial_port --|> i_serial_writer
+}
+
+' -------------------------------------------------------
+'  Concrete Implementation (Linux POSIX termios)
+' -------------------------------------------------------
+
+package "serial :: implementation" #F3E5F5 {
+
+    class serial_port {
+        - fd_ : int
+        - config_ : serial_config
+        __lifecycle__
+        + open(config) : bool
+        + close() : void
+        + is_open() : bool
+        + get_config() : const serial_config&
+        + flush() : bool
+        + drain() : bool
+        __read__
+        + read_byte(c : char&) : ssize_t
+        + read_chars(buf, len) : ssize_t
+        + read_string(str, max_len) : ssize_t
+        + read_bytes(buf, max_len) : ssize_t
+        + available() : int
+        __write__
+        + write_byte(c) : ssize_t
+        + write_chars(buf, len) : ssize_t
+        + write_string(str) : ssize_t
+        + write_bytes(buf) : ssize_t
+        __private helpers__
+        - apply_termios_config() : void
+        - baud_to_speed(baud) : speed_t
+    }
+
+    serial_port ..|> i_serial_port
+
+    note right of serial_port
+        Uses POSIX termios API:
+        • open(O_RDWR | O_NOCTTY)
+        • cfmakeraw + cfsetispeed / cfsetospeed
+        • tcsetattr(TCSANOW)
+        • ioctl(FIONREAD) for available()
+        • tcdrain / tcflush for drain / flush
+    end note
+}
+
+' -------------------------------------------------------
+'  High-Level Wrapper
+' -------------------------------------------------------
+
+package "serial :: wrapper" #E3F2FD {
+
+    class serial_wrapper {
+        - port_ : unique_ptr<i_serial_port>
+        - mutex_ : mutex
+        __lifecycle__
+        + serial_wrapper(port : unique_ptr<i_serial_port>)
+        + initialize(config) : bool
+        + shutdown() : void
+        + reconnect() : bool
+        + reconfigure(config) : bool
+        __status__
+        + is_ready() : bool
+        + get_config() : const serial_config&
+        __read (thread-safe)__
+        + read_byte(c) : ssize_t
+        + read_chars(buf, len) : ssize_t
+        + read_string(str, max_len) : ssize_t
+        + read_bytes(buf, max_len) : ssize_t
+        + available() : int
+        __write (thread-safe)__
+        + write_byte(c) : ssize_t
+        + write_chars(buf, len) : ssize_t
+        + write_string(str) : ssize_t
+        + write_bytes(buf) : ssize_t
+        __buffer__
+        + flush() : bool
+        + drain() : bool
+    }
+
+    serial_wrapper *-- i_serial_port : "owns\n(unique_ptr)"
+
+    note right of serial_wrapper
+        Dependency Inversion:
+        Depends on i_serial_port abstraction,
+        not on serial_port directly.
+        Inject serial_port (or a mock) at
+        construction via unique_ptr.
+
+        Thread-safety:
+        std::mutex guards every public method
+        so reader thread + writer thread can
+        share the wrapper safely.
+    end note
+}
+
+' -------------------------------------------------------
+'  Consumer (outside the library)
+' -------------------------------------------------------
+
+package "location_service :: hw_adapter" #ECEFF1 {
+
+    class gnss_controller {
+        - serial_ : unique_ptr<serial_wrapper>
+        + start(device_path : string) : bool
+        + stop() : void
+        + send_ubx_command(cmd : vector<uint8_t>) : bool
+        + read_ubx_frame(frame : vector<uint8_t>&) : bool
+    }
+
+    gnss_controller --> serial_wrapper : "uses"
+}
+
+@enduml
+
+' ============================================================
+'  PART 2 – DYNAMIC VIEW: Sequence Diagram
+' ============================================================
+
+@startuml serial_helper_sequence
+
+title serial_helper Library – Sequence Diagram (Dynamic View)
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceGroupBackgroundColor #F3F3F3
+skinparam sequenceLifeLineBorderColor #888888
+skinparam participantBackgroundColor #FEFEFE
+skinparam participantBorderColor #888888
+skinparam noteBorderColor #F9A825
+skinparam noteBackgroundColor #FFFDE7
+
+participant "gnss_controller"  as GNSS  #BBDEFB
+participant "serial_wrapper"   as WR    #C8E6C9
+participant "serial_port\n(i_serial_port)" as PORT  #E1BEE7
+participant "Linux Kernel\n(/dev/ttyXXX)" as KERN  #CFD8DC
+
+' ============================================================
+== Phase 1 : Initialization ==
+' ============================================================
+
+GNSS -> GNSS  : cfg = serial_config::gnss_default("/dev/ttyS0")
+note right of GNSS
+    9600 bps, 8N1, no flow ctrl
+    read_timeout_ms = 100
+end note
+
+GNSS -> GNSS  : port = make_unique<serial_port>()
+GNSS -> WR    : new serial_wrapper(std::move(port))
+activate WR
+WR -> WR      : port_ = std::move(port)
+
+GNSS -> WR    : initialize(cfg)
+activate WR
+WR -> WR      : lock mutex_
+WR -> PORT    : open(cfg)
+activate PORT
+
+PORT -> KERN  : ::open("/dev/ttyS0", O_RDWR|O_NOCTTY)
+activate KERN
+KERN --> PORT : fd_ = 3
+deactivate KERN
+
+PORT -> PORT  : apply_termios_config()
+note right of PORT
+    tcgetattr(fd)
+    cfmakeraw(&tty)
+    cfsetispeed / cfsetospeed  (B9600)
+    set CS8 / PARENB=0 / CSTOPB=0
+    CREAD | CLOCAL
+    VMIN=0, VTIME=1  (100 ms)
+    tcsetattr(fd, TCSANOW, &tty)
+    tcflush(fd, TCIOFLUSH)
+end note
+PORT --> WR   : true
+deactivate PORT
+
+WR -> WR      : unlock mutex_
+WR --> GNSS   : true
+deactivate WR
+
+' ============================================================
+== Phase 2 : Send UBX Configuration Command ==
+' ============================================================
+
+GNSS -> GNSS  : build ubx_cfg_rate as vector<uint8_t>
+note right of GNSS
+    UBX-CFG-RATE (B5 62 06 08 …)
+    sets measurement rate to 10 Hz
+end note
+
+GNSS -> WR    : write_bytes(ubx_cfg_rate)
+activate WR
+WR -> WR      : lock mutex_
+WR -> PORT    : write_bytes(ubx_cfg_rate)
+activate PORT
+PORT -> KERN  : ::write(fd_, buf, 14)
+activate KERN
+KERN --> PORT : 14  (bytes written)
+deactivate KERN
+PORT --> WR   : 14
+deactivate PORT
+WR -> WR      : unlock mutex_
+WR --> GNSS   : 14
+deactivate WR
+
+GNSS -> WR    : drain()
+activate WR
+WR -> WR      : lock mutex_
+WR -> PORT    : drain()
+activate PORT
+PORT -> KERN  : ::tcdrain(fd_)
+note right of KERN
+    Blocks until all bytes
+    have left the UART TX FIFO
+end note
+KERN --> PORT : 0
+deactivate KERN
+PORT --> WR   : true
+deactivate PORT
+WR --> GNSS   : true
+deactivate WR
+
+' ============================================================
+== Phase 3 : UBX Frame Read Loop ==
+' ============================================================
+
+loop while running (reader thread)
+
+    GNSS -> WR    : available()
+    activate WR
+    WR -> WR      : lock mutex_
+    WR -> PORT    : available()
+    activate PORT
+    PORT -> KERN  : ::ioctl(fd_, FIONREAD, &bytes)
+    KERN --> PORT : N bytes
+    deactivate PORT
+    WR -> WR      : unlock mutex_
+    WR --> GNSS   : N
+    deactivate WR
+
+    alt N > 0
+
+        GNSS -> WR    : read_bytes(frame_buf, N)
+        activate WR
+        WR -> WR      : lock mutex_
+        WR -> PORT    : read_bytes(frame_buf, N)
+        activate PORT
+        PORT -> KERN  : ::read(fd_, buf.data(), N)
+        KERN --> PORT : n (bytes read)
+        PORT -> PORT  : buf.resize(n)
+        PORT --> WR   : n
+        deactivate PORT
+        WR -> WR      : unlock mutex_
+        WR --> GNSS   : n
+        deactivate WR
+
+        GNSS -> GNSS  : parse_ubx_frame(frame_buf)
+        note right of GNSS
+            Validate sync chars B5 62
+            Verify checksum
+            Dispatch to position / velocity /
+            time parsers
+        end note
+
+    else N == 0
+
+        GNSS -> GNSS : sleep 10 ms
+
+    end
+
+end
+
+' ============================================================
+== Phase 4 : Reconfigure to 115200 (after chip baud change) ==
+' ============================================================
+
+GNSS -> WR    : reconfigure(serial_config::gnss_high_speed("/dev/ttyS0"))
+activate WR
+WR -> WR      : lock mutex_
+WR -> PORT    : close()
+activate PORT
+PORT -> KERN  : ::tcflush(fd_, TCIOFLUSH)
+PORT -> KERN  : ::close(fd_)
+KERN --> PORT : 0
+PORT -> PORT  : fd_ = -1
+deactivate PORT
+
+WR -> PORT    : open(new_config)
+activate PORT
+PORT -> KERN  : ::open("/dev/ttyS0", O_RDWR|O_NOCTTY)
+KERN --> PORT : fd_ = 3
+PORT -> PORT  : apply_termios_config()\n(cfsetispeed B115200)
+PORT --> WR   : true
+deactivate PORT
+
+WR -> WR      : unlock mutex_
+WR --> GNSS   : true
+deactivate WR
+
+' ============================================================
+== Phase 5 : Shutdown ==
+' ============================================================
+
+GNSS -> WR    : shutdown()
+activate WR
+WR -> WR      : lock mutex_
+WR -> PORT    : close()
+activate PORT
+PORT -> KERN  : ::tcflush(fd_, TCIOFLUSH)
+PORT -> KERN  : ::close(fd_)
+KERN --> PORT : 0
+PORT -> PORT  : fd_ = -1
+PORT --> WR   : (done)
+deactivate PORT
+WR -> WR      : unlock mutex_
+deactivate WR
+
+GNSS -> GNSS  : (serial session ended)
+
+@enduml
